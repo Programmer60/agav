@@ -1,5 +1,5 @@
 import React from "react";
-import { Box, Text, ScrollBox, useInput, useStdout } from "../ink/index.js";
+import { Box, Text, ScrollBox, useInput, usePaste, useStdout } from "../ink/index.js";
 import type { ScrollBoxControls } from "../ink/index.js";
 import { getToolLabel, getToolSummary, getMcpServerName } from "../utils/tool-labels.js";
 import type { DiffLine } from "../utils/diff.js";
@@ -7,9 +7,10 @@ import { getTheme } from "../config/theme.js";
 import { KeybindingResolver, normalizeKeyEvent, type Keybindings } from "../config/keybindings.js";
 import { terminalToolValue } from "../utils/display-path.js";
 import { describeBackgroundConfirmation, detailViewport, parseBackgroundConfirmInput } from "./background-confirmation.js";
+import type { ConfirmResult } from "../agent/loop.js";
 
 /** Represents the user's approval decision for a tool request. */
-export type ConfirmChoice = "yes" | "no" | "always";
+export type ConfirmChoice = ConfirmResult;
 
 interface Props {
   toolName: string;
@@ -29,14 +30,46 @@ export default function ToolConfirm({ toolName, input, diffLines, mcpServerName,
   const [rows, setRows] = React.useState(stdout.rows || 24);
   const detailScroll = React.useRef<ScrollBoxControls | null>(null);
   const [detailOffset, setDetailOffset] = React.useState(Number.POSITIVE_INFINITY);
+  const [isFeedbackMode, setIsFeedbackMode] = React.useState(false);
+  const [feedbackText, setFeedbackText] = React.useState("");
+
   React.useEffect(() => {
     const resize = () => setRows(stdout.rows || 24);
     stdout.on("resize", resize);
     return () => { stdout.off("resize", resize); };
   }, [stdout]);
+
+  usePaste((text) => {
+    if (isFeedbackMode && text) {
+      setFeedbackText((prev) => prev + text.replace(/[\r\n]+/g, " "));
+    }
+  });
+
   // Background approval is reusable and runs unsandboxed, so show the spec in full.
   const background = toolName === "run_background_job" ? parseBackgroundConfirmInput(input) : undefined;
   useInput((rawChar, rawKey) => {
+    if (isFeedbackMode) {
+      if (rawKey.escape) {
+        setIsFeedbackMode(false);
+        setFeedbackText("");
+        return;
+      }
+      if (rawKey.return) {
+        const trimmed = feedbackText.trim();
+        onConfirm(trimmed ? { choice: "no", feedback: trimmed } : "no");
+        return;
+      }
+      if (rawKey.backspace || rawKey.delete) {
+        setFeedbackText((prev) => prev.slice(0, -1));
+        return;
+      }
+      if (rawChar && !rawKey.ctrl && !rawKey.meta) {
+        setFeedbackText((prev) => prev + rawChar);
+        return;
+      }
+      return;
+    }
+
     if (background && (rawKey.upArrow || rawKey.downArrow)) {
       detailScroll.current?.scrollBy(rawKey.upArrow ? 1 : -1);
       return;
@@ -47,6 +80,8 @@ export default function ToolConfirm({ toolName, input, diffLines, mcpServerName,
       onConfirm("yes");
     } else if (char === "n" || char === "N" || match.action === "cancel") {
       onConfirm("no");
+    } else if ((char === "d" || char === "D") && !background) {
+      setIsFeedbackMode(true);
     } else if ((char === "a" || char === "A") && !explicitApprovalOnly) {
       onConfirm("always");
     }
@@ -143,15 +178,28 @@ export default function ToolConfirm({ toolName, input, diffLines, mcpServerName,
       )}
 
       <Box marginTop={1}>
-        <Text>
-          <Text bold color="green">[Y]es</Text>
-          <Text> / </Text>
-          <Text bold color="red">[N]o</Text>
-          {!explicitApprovalOnly && <>
+        {isFeedbackMode ? (
+          <Box flexDirection="column">
+            <Box>
+              <Text bold color="yellow">Feedback for agent: </Text>
+              <Text color="cyan">{feedbackText}</Text>
+              <Text color="cyan">█</Text>
+            </Box>
+            <Text dimColor>Enter to submit denial · Esc to cancel</Text>
+          </Box>
+        ) : (
+          <Text>
+            <Text bold color="green">[Y]es</Text>
             <Text> / </Text>
-            <Text bold color="cyan">[A]lways</Text>
-          </>}
-        </Text>
+            <Text bold color="red">[N]o</Text>
+            <Text> / </Text>
+            <Text bold color="yellow">[D]eny with feedback</Text>
+            {!explicitApprovalOnly && <>
+              <Text> / </Text>
+              <Text bold color="cyan">[A]lways</Text>
+            </>}
+          </Text>
+        )}
       </Box>
     </Box>
   );

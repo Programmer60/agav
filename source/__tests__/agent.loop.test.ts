@@ -1034,4 +1034,180 @@ describe("runAgentLoop", () => {
     expect(denials.every((event) => (event as { isError?: boolean }).isError)).toBe(true);
     expect((denials[1] as { output: string }).output).toContain("already denied");
   });
+
+  it("denies tool with feedback, includes feedback in tool_result, and feeds it to the next provider turn", async () => {
+    let turn = 0;
+    const provider: LLMProvider = {
+      name: "mock",
+      stream: vi.fn((_params: StreamParams) => {
+        turn++;
+        const events: StreamEvent[] = turn === 1
+          ? [
+              { type: "tool_call_start", toolCallId: "call-1", toolName: "risky_write" },
+              { type: "tool_call_delta", toolCallId: "call-1", argsJson: '{"path":"a.txt"}' },
+              { type: "tool_call_end", toolCallId: "call-1" },
+              { type: "message_end", stopReason: "tool_calls" },
+            ]
+          : [
+              { type: "text_delta", text: "Understood, will write b.txt instead." },
+              { type: "message_end", stopReason: "end_turn" },
+            ];
+        return (async function* () {
+          for (const event of events) yield event;
+        })();
+      }),
+    };
+
+    const conversation = new ConversationState();
+    conversation.setModel("gpt-4");
+    conversation.addUserMessage("write file");
+
+    const execute = vi.fn(async () => ({ output: "written", isError: false }));
+    const toolRegistry = new ToolRegistry();
+    toolRegistry.register(createTool("risky_write", execute));
+
+    const confirmTool = vi.fn(async () => ({
+      choice: "no" as const,
+      feedback: "Do not write a.txt; write b.txt instead.",
+    }));
+
+    const events = await collectEvents(
+      runAgentLoop({
+        provider,
+        conversation,
+        toolRegistry,
+        model: "gpt-4",
+        confirmTool,
+        iterationsBudget: { remaining: 5, total: 5 },
+      }),
+    );
+
+    expect(confirmTool).toHaveBeenCalledTimes(1);
+    expect(execute).not.toHaveBeenCalled();
+
+    const toolResultEvent = events.find(
+      (e) => e.type === "tool_result" && e.toolName === "risky_write",
+    );
+    expect(toolResultEvent).toBeDefined();
+    expect((toolResultEvent as any).isError).toBe(true);
+    expect((toolResultEvent as any).output).toContain("User denied this tool call with feedback: Do not write a.txt; write b.txt instead.");
+
+    expect(provider.stream).toHaveBeenCalledTimes(2);
+    const secondCallParams = (provider.stream as any).mock.calls[1][0];
+    const secondCallMessages = secondCallParams.messages;
+    const userMsgWithToolResult = secondCallMessages.find(
+      (m: any) => m.role === "user" && m.content.some((c: any) => c.type === "tool_result"),
+    );
+    expect(userMsgWithToolResult).toBeDefined();
+    const resultBlock = userMsgWithToolResult.content.find((c: any) => c.type === "tool_result");
+    expect(resultBlock.toolResult).toContain("User denied this tool call with feedback: Do not write a.txt; write b.txt instead.");
+    expect(resultBlock.isError).toBe(true);
+  });
+
+  it("treats blank or whitespace-only feedback as a standard denial", async () => {
+    const provider = new MockProvider([[
+      { type: "tool_call_start", toolCallId: "call-blank", toolName: "risky_write" },
+      { type: "tool_call_delta", toolCallId: "call-blank", argsJson: '{"path":"blank.txt"}' },
+      { type: "tool_call_end", toolCallId: "call-blank" },
+      { type: "message_end", stopReason: "tool_calls" },
+    ]]);
+
+    const conversation = new ConversationState();
+    conversation.setModel("gpt-4");
+    conversation.addUserMessage("write blank");
+
+    const execute = vi.fn(async () => ({ output: "written", isError: false }));
+    const toolRegistry = new ToolRegistry();
+    toolRegistry.register(createTool("risky_write", execute));
+
+    const confirmTool = vi.fn(async () => ({
+      choice: "no" as const,
+      feedback: "   ",
+    }));
+
+    const events = await collectEvents(
+      runAgentLoop({
+        provider,
+        conversation,
+        toolRegistry,
+        model: "gpt-4",
+        confirmTool,
+        iterationsBudget: { remaining: 5, total: 5 },
+      }),
+    );
+
+    expect(execute).not.toHaveBeenCalled();
+    const toolResultEvent = events.find(
+      (e) => e.type === "tool_result" && e.toolName === "risky_write",
+    );
+    expect((toolResultEvent as any).output).toBe(
+      "User denied this tool call. Do not retry it with the same arguments — take a different approach, or stop and explain what you need.",
+    );
+    expect((toolResultEvent as any).output).not.toContain("with feedback");
+  });
+
+  it("handles a mixed batch of tool calls by denying one with feedback and executing the approved tool", async () => {
+    const provider = new MockProvider([
+      [
+        { type: "tool_call_start", toolCallId: "call-a", toolName: "tool_a" },
+        { type: "tool_call_delta", toolCallId: "call-a", argsJson: '{"target":"a"}' },
+        { type: "tool_call_end", toolCallId: "call-a" },
+        { type: "tool_call_start", toolCallId: "call-b", toolName: "tool_b" },
+        { type: "tool_call_delta", toolCallId: "call-b", argsJson: '{"target":"b"}' },
+        { type: "tool_call_end", toolCallId: "call-b" },
+        { type: "message_end", stopReason: "tool_calls" },
+      ],
+      [
+        { type: "text_delta", text: "completed turn" },
+        { type: "message_end", stopReason: "end_turn" },
+      ],
+    ]);
+
+    const conversation = new ConversationState();
+    conversation.setModel("gpt-4");
+    conversation.addUserMessage("run both tools");
+
+    const executeA = vi.fn(async () => ({ output: "output A", isError: false }));
+    const executeB = vi.fn(async () => ({ output: "output B", isError: false }));
+    const toolRegistry = new ToolRegistry();
+    toolRegistry.register(createTool("tool_a", executeA));
+    toolRegistry.register(createTool("tool_b", executeB));
+
+    const confirmTool = vi.fn(async (toolName: string) => {
+      if (toolName === "tool_a") {
+        return { choice: "no" as const, feedback: "skip tool A" };
+      }
+      return "yes" as const;
+    });
+
+    const events = await collectEvents(
+      runAgentLoop({
+        provider,
+        conversation,
+        toolRegistry,
+        model: "gpt-4",
+        confirmTool,
+        iterationsBudget: { remaining: 5, total: 5 },
+      }),
+    );
+
+    expect(executeA).not.toHaveBeenCalled();
+    expect(executeB).toHaveBeenCalledTimes(1);
+
+    const resultA = events.find((e) => e.type === "tool_result" && e.toolName === "tool_a");
+    const resultB = events.find((e) => e.type === "tool_result" && e.toolName === "tool_b");
+
+    expect((resultA as any).isError).toBe(true);
+    expect((resultA as any).output).toContain("User denied this tool call with feedback: skip tool A");
+
+    expect((resultB as any).isError).toBe(false);
+    expect((resultB as any).output).toBe("output B");
+
+    // Both results are in conversation
+    const messages = conversation.getMessages();
+    const toolResultMsg = messages.find((m) => m.role === "user" && m.content.some((c) => c.type === "tool_result"));
+    expect(toolResultMsg?.content).toHaveLength(2);
+    expect(toolResultMsg?.content[0]?.toolCallId).toBe("call-a");
+    expect(toolResultMsg?.content[1]?.toolCallId).toBe("call-b");
+  });
 });

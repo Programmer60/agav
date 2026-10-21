@@ -2,7 +2,7 @@ import { describe, expect, it, vi, beforeEach, afterEach } from "vitest";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { runAgentLoop } from "../agent/loop.js";
+import { runAgentLoop, MAX_FEEDBACK_LENGTH, countGraphemes } from "../agent/loop.js";
 import { ConversationState } from "../agent/conversation.js";
 import { ConfirmationQueue } from "../agent/confirmation-queue.js";
 import { ToolRegistry } from "../tools/registry.js";
@@ -1144,6 +1144,159 @@ describe("runAgentLoop", () => {
       "User denied this tool call. Do not retry it with the same arguments — take a different approach, or stop and explain what you need.",
     );
     expect((toolResultEvent as any).output).not.toContain("with feedback");
+  });
+
+  it("truncates denial feedback exceeding MAX_FEEDBACK_LENGTH", async () => {
+    const provider = new MockProvider([[
+      { type: "tool_call_start", toolCallId: "call-long", toolName: "risky_write" },
+      { type: "tool_call_delta", toolCallId: "call-long", argsJson: '{"path":"long.txt"}' },
+      { type: "tool_call_end", toolCallId: "call-long" },
+      { type: "message_end", stopReason: "tool_calls" },
+    ]]);
+
+    const conversation = new ConversationState();
+    conversation.setModel("gpt-4");
+    conversation.addUserMessage("write long");
+
+    const execute = vi.fn(async () => ({ output: "written", isError: false }));
+    const toolRegistry = new ToolRegistry();
+    toolRegistry.register(createTool("risky_write", execute));
+
+    const confirmTool = vi.fn(async () => ({
+      choice: "no" as const,
+      feedback: "a".repeat(MAX_FEEDBACK_LENGTH + 100),
+    }));
+
+    const events = await collectEvents(
+      runAgentLoop({
+        provider,
+        conversation,
+        toolRegistry,
+        model: "gpt-4",
+        confirmTool,
+        iterationsBudget: { remaining: 5, total: 5 },
+      }),
+    );
+
+    expect(execute).not.toHaveBeenCalled();
+    const toolResultEvent = events.find(
+      (e) => e.type === "tool_result" && e.toolName === "risky_write",
+    );
+    expect((toolResultEvent as any).output).toContain(
+      `User denied this tool call with feedback: ${"a".repeat(MAX_FEEDBACK_LENGTH)}\nDo not retry it with the same arguments`,
+    );
+    expect((toolResultEvent as any).output).not.toContain("a".repeat(MAX_FEEDBACK_LENGTH + 1));
+  });
+
+  it("defensively truncates denial feedback exceeding MAX_FEEDBACK_LENGTH without splitting composite grapheme clusters", async () => {
+    const provider = new MockProvider([[
+      { type: "tool_call_start", toolCallId: "call-emoji", toolName: "risky_write" },
+      { type: "tool_call_delta", toolCallId: "call-emoji", argsJson: '{"path":"emoji.txt"}' },
+      { type: "tool_call_end", toolCallId: "call-emoji" },
+      { type: "message_end", stopReason: "tool_calls" },
+    ]]);
+
+    const conversation = new ConversationState();
+    conversation.setModel("gpt-4");
+    conversation.addUserMessage("write emoji");
+
+    const execute = vi.fn(async () => ({ output: "written", isError: false }));
+    const toolRegistry = new ToolRegistry();
+    toolRegistry.register(createTool("risky_write", execute));
+
+    const compositeEmoji = "👨‍👩‍👧‍👦";
+    const confirmTool = vi.fn(async () => ({
+      choice: "no" as const,
+      feedback: compositeEmoji.repeat(MAX_FEEDBACK_LENGTH + 10),
+    }));
+
+    const events = await collectEvents(
+      runAgentLoop({
+        provider,
+        conversation,
+        toolRegistry,
+        model: "gpt-4",
+        confirmTool,
+        iterationsBudget: { remaining: 5, total: 5 },
+      }),
+    );
+
+    expect(execute).not.toHaveBeenCalled();
+    const toolResultEvent = events.find(
+      (e) => e.type === "tool_result" && e.toolName === "risky_write",
+    );
+    expect((toolResultEvent as any).output).toContain(
+      `User denied this tool call with feedback: ${compositeEmoji.repeat(MAX_FEEDBACK_LENGTH)}\nDo not retry it with the same arguments`,
+    );
+    expect((toolResultEvent as any).output).not.toContain(compositeEmoji.repeat(MAX_FEEDBACK_LENGTH + 1));
+  });
+
+  it("preserves joined emoji and combining characters across the boundary and never produces partial graphemes", async () => {
+    const provider = new MockProvider([[
+      { type: "tool_call_start", toolCallId: "call-combining", toolName: "risky_write" },
+      { type: "tool_call_delta", toolCallId: "call-combining", argsJson: '{"path":"combining.txt"}' },
+      { type: "tool_call_end", toolCallId: "call-combining" },
+      { type: "message_end", stopReason: "tool_calls" },
+    ]]);
+
+    const conversation = new ConversationState();
+    conversation.setModel("gpt-4");
+    conversation.addUserMessage("write combining");
+
+    const execute = vi.fn(async () => ({ output: "written", isError: false }));
+    const toolRegistry = new ToolRegistry();
+    toolRegistry.register(createTool("risky_write", execute));
+
+    // Construct a sequence of 499 ASCII characters, followed by a joined emoji as the 500th grapheme,
+    // and combining character sequences + skin-tone emoji as the 501st and beyond.
+    const familyZWJ = "👨‍👩‍👧‍👦"; // 1 grapheme cluster (11 UTF-16 code units with ZWJ)
+    const acuteE = "e\u0301"; // 1 grapheme cluster (2 UTF-16 code units)
+    const technologist = "👩‍💻"; // 1 grapheme cluster (5 UTF-16 code units)
+    const wavingHand = "👋🏽"; // 1 grapheme cluster (4 UTF-16 code units)
+
+    const prefix = "a".repeat(499);
+    // Graphemes: 499 (prefix) + 1 (familyZWJ) + 1 (acuteE) + 1 (technologist) + 1 (wavingHand) = 503 graphemes
+    const oversizedFeedback = `${prefix}${familyZWJ}${acuteE}${technologist}${wavingHand}`;
+
+    const confirmTool = vi.fn(async () => ({
+      choice: "no" as const,
+      feedback: oversizedFeedback,
+    }));
+
+    const events = await collectEvents(
+      runAgentLoop({
+        provider,
+        conversation,
+        toolRegistry,
+        model: "gpt-4",
+        confirmTool,
+        iterationsBudget: { remaining: 5, total: 5 },
+      }),
+    );
+
+    expect(execute).not.toHaveBeenCalled();
+    const toolResultEvent = events.find(
+      (e) => e.type === "tool_result" && e.toolName === "risky_write",
+    );
+    expect(toolResultEvent).toBeDefined();
+
+    // Extract the feedback substring from the toolResult output
+    const match = /with feedback: (.*?)\nDo not retry/s.exec((toolResultEvent as any).output);
+    expect(match).not.toBeNull();
+    const finalFeedback = match![1]!;
+
+    // Exactly 500 grapheme clusters: 499 'a's plus the unbroken family ZWJ emoji
+    expect(countGraphemes(finalFeedback)).toBe(MAX_FEEDBACK_LENGTH);
+    expect(finalFeedback).toBe(`${prefix}${familyZWJ}`);
+
+    // Must NOT contain any part of the 501st grapheme (acuteE) or subsequent graphemes
+    expect(finalFeedback).not.toContain(acuteE);
+    expect(finalFeedback).not.toContain(technologist);
+    expect(finalFeedback).not.toContain(wavingHand);
+
+    // Verify there are no lone surrogates or trailing unattached combining marks / ZWJ
+    expect(finalFeedback.endsWith("\u200D")).toBe(false);
+    expect(/\p{M}$/u.test(finalFeedback)).toBe(false);
   });
 
   it("handles a mixed batch of tool calls by denying one with feedback and executing the approved tool", async () => {
